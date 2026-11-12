@@ -195,6 +195,58 @@ public class HttpParserTest
     }
 
     @Test
+    public void testRelativeRequestTargetRejected() throws Exception
+    {
+        String[] requests = new String[]
+        {
+            // A path parameter must not turn "http://localhost:8080;@host.org/url" into a request for host.org
+            "GET ;@host.org/url HTTP/1.1\015\012Host: localhost:8080\015\012\015\012",
+            "GET host.org/url HTTP/1.1\015\012Host: localhost:8080\015\012\015\012",
+            "GET localhost:8080 HTTP/1.1\015\012Host: localhost:8080\015\012\015\012",
+            "GET ;@host.org/url\015\012",
+            "GET ;@host.org/url \015\012",
+        };
+
+        for (String request : requests)
+        {
+            init();
+            HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+            HttpParser parser= new HttpParser(handler);
+            parser.parseNext(BufferUtil.toBuffer(request));
+            assertEquals(request,"400",_bad);
+            assertNull(request,_methodOrVersion);
+            assertNull(request,_uriOrStatus);
+            assertEquals(request,HttpParser.State.CLOSED,parser.getState());
+        }
+    }
+
+    @Test
+    public void testRequestTargetForms() throws Exception
+    {
+        String[][] requests = new String[][]
+        {
+            {"CONNECT host:443 HTTP/1.1\015\012Host: host:443\015\012\015\012","CONNECT","host:443"},
+            {"OPTIONS * HTTP/1.1\015\012Host: localhost\015\012\015\012","OPTIONS","*"},
+            {"GET http://host/path HTTP/1.1\015\012Host: localhost\015\012\015\012","GET","http://host/path"},
+            {"GET /path HTTP/1.1\015\012Host: localhost\015\012\015\012","GET","/path"},
+        };
+
+        for (String[] request : requests)
+        {
+            init();
+            HttpParser.RequestHandler<ByteBuffer> handler  = new Handler();
+            HttpParser parser= new HttpParser(handler);
+            parseAll(parser,BufferUtil.toBuffer(request[0]));
+            assertNull(request[0],_bad);
+            assertEquals(request[0],request[1],_methodOrVersion);
+            assertEquals(request[0],request[2],_uriOrStatus);
+            assertEquals(request[0],"HTTP/1.1",_versionOrReason);
+            assertTrue(request[0],_headerCompleted);
+            assertTrue(request[0],_messageCompleted);
+        }
+    }
+
+    @Test
     public void testSimple() throws Exception
     {
         ByteBuffer buffer= BufferUtil.toBuffer(

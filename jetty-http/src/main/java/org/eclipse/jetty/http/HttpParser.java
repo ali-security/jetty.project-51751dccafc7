@@ -476,6 +476,53 @@ public class HttpParser
     }
 
     /* ------------------------------------------------------------------------------- */
+    /* Check the request-target is in origin-form ("/path"), absolute-form ("scheme://..."),
+     * asterisk-form ("*") or, for CONNECT only, authority-form. Any other relative target
+     * (eg ";@host/path") is rejected, as it may be combined with the authority from the
+     * Host header to form a URI with a different host.
+     */
+    private void checkRequestTarget()
+    {
+        int p=_uri.position();
+        int l=_uri.limit();
+        if (p>=l)
+            throw new BadMessageException(HttpStatus.BAD_REQUEST_400);
+
+        byte b=_uri.get(p);
+
+        // origin-form
+        if (b=='/')
+            return;
+
+        // asterisk-form
+        if (b=='*' && l-p==1)
+            return;
+
+        // authority-form, validated by the CONNECT handler
+        if (_method==HttpMethod.CONNECT)
+            return;
+
+        // absolute-form: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) followed by "://"
+        if ((b>='a' && b<='z') || (b>='A' && b<='Z'))
+        {
+            for (int i=p+1;i<l;i++)
+            {
+                b=_uri.get(i);
+                if (b==':')
+                {
+                    if (l-i>2 && _uri.get(i+1)=='/' && _uri.get(i+2)=='/')
+                        return;
+                    break;
+                }
+                if (!((b>='a' && b<='z') || (b>='A' && b<='Z') || (b>='0' && b<='9') || b=='+' || b=='-' || b=='.'))
+                    break;
+            }
+        }
+
+        throw new BadMessageException(HttpStatus.BAD_REQUEST_400);
+    }
+
+    /* ------------------------------------------------------------------------------- */
     /* Parse a request or response line
      */
     private boolean parseLine(ByteBuffer buffer)
@@ -625,6 +672,7 @@ public class HttpParser
                     {
                         // HTTP/0.9
                         _uri.flip();
+                        checkRequestTarget();
                         handle=_requestHandler.startRequest(_method,_methodString,_uri,null)||handle;
                         setState(State.END);
                         BufferUtil.clear(buffer);
@@ -721,6 +769,7 @@ public class HttpParser
                         {
                             // HTTP/0.9
                             _uri.flip();
+                            checkRequestTarget();
                             handle=_requestHandler.startRequest(_method,_methodString,_uri, null)||handle;
                             setState(State.END);
                             BufferUtil.clear(buffer);
@@ -753,6 +802,7 @@ public class HttpParser
 
                         setState(State.HEADER);
                         _uri.flip();
+                        checkRequestTarget();
                         handle=_requestHandler.startRequest(_method,_methodString,_uri, _version)||handle;
                         continue;
                     }
