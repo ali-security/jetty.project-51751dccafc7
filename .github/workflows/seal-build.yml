@@ -1,0 +1,139 @@
+# Authored by agentic-sealer: upstream Jetty 9.2.x has no GitHub Actions CI (it builds on
+# Jenkins, see Jenkinsfile: JDK 7 + `mvn -B clean install`). This workflow mirrors that
+# build on JDK 7 for the jetty-http module and the modules whose tests cover the CVE paths.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MAVEN_OPTS: "-Xms256m -Xmx2g -XX:MaxPermSize=512m -Djava.awt.headless=true -Dhttps.protocols=TLSv1.2"
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/setup-java no longer lists Zulu 7, so fetch the last Zulu 7 build directly.
+      - name: Set up JDK 7 (release Build-Jdk is 1.7.0_75)
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/jdk7"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$RUNNER_TEMP/jdk7.tgz" \
+            https://cdn.azul.com/zulu/bin/zulu7.56.0.11-ca-jdk7.0.352-linux_x64.tar.gz
+          tar xzf "$RUNNER_TEMP/jdk7.tgz" -C "$RUNNER_TEMP/jdk7" --strip-components=1
+          echo "JAVA_HOME=$RUNNER_TEMP/jdk7" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/jdk7/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/jdk7/bin/java" -version
+
+      - name: Install Maven 3.8.8
+        run: |
+          set -e
+          cd "$RUNNER_TEMP"
+          for URL in https://repo1.maven.org/maven2/org/apache/maven/apache-maven/3.8.8/apache-maven-3.8.8-bin.tar.gz \
+                     https://archive.apache.org/dist/maven/maven-3/3.8.8/binaries/apache-maven-3.8.8-bin.tar.gz; do
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o maven.tgz "$URL" && break
+          done
+          tar xzf maven.tgz
+          # jetty-version-maven-plugin needs artifacts only on repo.jenkins-ci.org; route all
+          # other repositories (some poms still declare http:// URLs) to Maven Central over https.
+          cat > apache-maven-3.8.8/conf/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-https</id>
+                <mirrorOf>*,!jenkins-ci</mirrorOf>
+                <url>https://repo1.maven.org/maven2</url>
+              </mirror>
+            </mirrors>
+            <profiles>
+              <profile>
+                <id>jenkins</id>
+                <repositories>
+                  <repository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></repository>
+                </repositories>
+                <pluginRepositories>
+                  <pluginRepository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>jenkins</activeProfile></activeProfiles>
+          </settings>
+          EOF
+          echo "$RUNNER_TEMP/apache-maven-3.8.8/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test jetty-http (with jetty-util)
+        if: ${{ inputs.test-filter == '' }}
+        run: mvn -B -V -e -ntp clean install -pl jetty-http -am
+
+      - name: Stage release artifacts
+        if: ${{ inputs.test-filter == '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp jetty-http/target/jetty-http-9.2.24.v20180105.jar jetty-http/target/jetty-http-9.2.24.v20180105-tests.jar "$RUNNER_TEMP/out/"
+          ls -l "$RUNNER_TEMP/out"
+
+      - name: Test CVE-patched paths (jetty-server, jetty-client, jetty-proxy)
+        if: ${{ inputs.test-filter == '' }}
+        run: >-
+          mvn -B -V -e -ntp install -pl jetty-server,jetty-client,jetty-proxy -am
+          -Dtest=RequestTest,HttpConnectionTest,PartialRFC2616Test,HttpURITest,HttpParserTest,HttpClientURITest,ConnectHandlerTest,ConnectHandlerSSLTest,ProxyTunnellingTest
+          -DfailIfNoTests=false
+
+      - name: Run selected tests
+        if: ${{ inputs.test-filter != '' }}
+        run: |
+          mvn -B -V -e -ntp clean install -pl jetty-http,jetty-server,jetty-client,jetty-proxy -am \
+            -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          mkdir -p "$RUNNER_TEMP/out"
+          cp jetty-http/target/jetty-http-9.2.24.v20180105.jar jetty-http/target/jetty-http-9.2.24.v20180105-tests.jar "$RUNNER_TEMP/out/"
+
+      - name: Surefire results summary (per-class counts and skipped tests with reasons)
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          # Surefire 2.17 records no message for bare @Ignore / Assume skips; reasons from the sources:
+          REASONS = {
+              "LazyListTest": "assumeTrue(STRICT) with STRICT=false in the test class",
+              "QueueBenchmarkTest": "@Stress benchmark, skipped by AdvancedRunner unless stress tests are enabled",
+              "PathResourceTest": "class-level @Ignore (\"not utilized in 9.2\")",
+              "ResourceTest": "UNC path test only runs on Windows (assume OS.IS_WINDOWS)",
+              "SchedulerTest": "@Slow @Ignore benchmark methods",
+              "BufferUtilTest": "@Ignore microbenchmark",
+              "ProxyTunnellingTest": "@Ignore testExternalProxy needs an external proxy on the internet",
+          }
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skipped = []
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              r = ET.parse(f).getroot()
+              c = {k: int(r.get(k, 0)) for k in tot}
+              for k in tot:
+                  tot[k] += c[k]
+              print("%-80s tests=%d failures=%d errors=%d skipped=%d" % (r.get("name"), c["tests"], c["failures"], c["errors"], c["skipped"]))
+              for tc in r.iter("testcase"):
+                  s = tc.find("skipped")
+                  if s is not None:
+                      cls = tc.get("classname", "")
+                      msg = s.get("message") or REASONS.get(cls.split(".")[-1], "@Ignore/Assume without message")
+                      skipped.append("%s#%s: %s" % (cls, tc.get("name"), msg))
+          print("\nSKIPPED TESTS (%d):" % len(skipped))
+          for s in skipped:
+              print("  SKIP-REASON " + s)
+          print("\nTOTAL: Tests run: %(tests)d, Failures: %(failures)d, Errors: %(errors)d, Skipped: %(skipped)d" % tot)
+          print("PASSED: %d" % (tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]))
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-http-jars
+          path: ${{ runner.temp }}/out/*.jar
+          if-no-files-found: error
