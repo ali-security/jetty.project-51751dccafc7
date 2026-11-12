@@ -799,15 +799,7 @@ public class HttpParser
             case CONTENT_LENGTH:
                 if (_endOfContent != EndOfContent.CHUNKED_CONTENT)
                 {
-                    try
-                    {
-                        _contentLength=Long.parseLong(_valueString);
-                    }
-                    catch(NumberFormatException e)
-                    {
-                        LOG.ignore(e);
-                        throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
-                    }
+                    _contentLength=convertContentLength(_valueString);
                     if (_contentLength <= 0)
                         _endOfContent=EndOfContent.NO_CONTENT;
                     else
@@ -880,11 +872,39 @@ public class HttpParser
             _field=new HttpField(_header,_valueString);
             _connectionFields.put(_field);
         }
-        
+
         return false;
     }
-    
-    
+
+    /* ------------------------------------------------------------------------------- */
+    /*
+     * Strictly parse a Content-Length value: only a non empty sequence of
+     * DIGIT characters (RFC 7230 section 3.3.2) that fits in a long is accepted.
+     * Signs, whitespace, decimal points, separators and overflowing values are rejected.
+     */
+    private long convertContentLength(String valueString)
+    {
+        if (valueString==null || valueString.length()==0)
+            throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
+
+        long value=0;
+        int length=valueString.length();
+
+        for (int i=0;i<length;i++)
+        {
+            char c=valueString.charAt(i);
+            if (c<'0' || c>'9')
+                throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
+
+            int digit=c-'0';
+            if (value>(Long.MAX_VALUE-digit)/10)
+                throw new BadMessageException(HttpStatus.BAD_REQUEST_400,"Bad Content-Length");
+            value=value*10+digit;
+        }
+        return value;
+    }
+
+
     /* ------------------------------------------------------------------------------- */
     /*
      * Parse the message headers and return true if the handler has signaled for a return
